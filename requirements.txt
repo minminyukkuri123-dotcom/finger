@@ -1,0 +1,8 @@
+tensorflow>=2.13
+mediapipe>=0.10
+kagglehub
+tensorflow-datasets
+opencv-python
+numpy
+matplotlib
+scikit-learn
