@@ -1,13 +1,12 @@
 """
-ステップ3: リアルタイム推論 + 発動判定
+ステップ3: リアルタイム推論
 目的: カメラ映像から手のグー/チョキ/パーをリアルタイム判定し、
-      静止ポーズを検出した際に演出を発動する。
+      検出したポーズを表示する（最大2つの手に対応）。
 
 使い方:
   source .venv/bin/activate
   python step3_realtime.py
   - カメラに手をかざしてポーズを見せる
-  - 同じポーズを数秒キープ → 演出が発動
   - 'q' キーで終了
 """
 
@@ -24,19 +23,15 @@ from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 
 # --- 設定の読み込み ---
 from config import (
-    IMG_SIZE, RPS_MODEL_PATH, RPS_CLASSES, RPS_LABELS_JP,
-    CONFIDENCE_THRESHOLD, TRIGGER_FRAMES, COOLDOWN_SEC,
-    TRIGGER_EFFECTS
+    IMG_SIZE, RPS_MODEL_PATH, RPS_CLASSES,
+    CONFIDENCE_THRESHOLD, HAND_MODEL_PATH
 )
-
-# MediaPipe Hand Landmarker モデルパス
-HAND_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "hand_landmarker.task")
 
 
 class HandDetector:
     """MediaPipe HandLandmarker による手の検出・切り出し"""
 
-    def __init__(self, model_path=HAND_MODEL_PATH, num_hands=1,
+    def __init__(self, model_path=HAND_MODEL_PATH, num_hands=2,
                  min_detection_confidence=0.5):
         options = vision.HandLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=model_path),
@@ -50,9 +45,10 @@ class HandDetector:
 
     def detect(self, frame):
         """
+        [両手対応]
         手を検出し、背景を除去したcrop画像を返す。
-        ランドマークの凸包でマスクを作り、背景を白で塗りつぶす。
-        戻り値: (crop_image, bbox, landmarks_list) or (None, None, None)
+        戻り値: results = [(crop_image, bbox, landmarks_list), ...]
+        手が検出されなければ空リスト [] を返す。
         """
         h, w, _ = frame.shape
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -60,63 +56,66 @@ class HandDetector:
         result = self.detector.detect(mp_image)
 
         if not result.hand_landmarks:
-            return None, None, None
+            return []
 
-        # 最初に検出された手を使用
-        hand_lm = result.hand_landmarks[0]
+        detection_results = []
 
-        # ランドマーク座標をピクセル座標に変換
-        pts = np.array([[int(lm.x * w), int(lm.y * h)] for lm in hand_lm])
+        # 検出されたすべての手に対して処理
+        for hand_lm in result.hand_landmarks:
+            # ランドマーク座標をピクセル座標に変換
+            pts = np.array([[int(lm.x * w), int(lm.y * h)] for lm in hand_lm])
 
-        # バウンディングボックスを計算（手のサイズに比例したマージン）
-        x_min_raw = pts[:, 0].min()
-        y_min_raw = pts[:, 1].min()
-        x_max_raw = pts[:, 0].max()
-        y_max_raw = pts[:, 1].max()
+            # バウンディングボックスを計算（手のサイズに比例したマージン）
+            x_min_raw = pts[:, 0].min()
+            y_min_raw = pts[:, 1].min()
+            x_max_raw = pts[:, 0].max()
+            y_max_raw = pts[:, 1].max()
 
-        hand_w = x_max_raw - x_min_raw
-        hand_h = y_max_raw - y_min_raw
-        margin = int(max(hand_w, hand_h) * 0.15)  # 手のサイズの15%分マージン
+            hand_w = x_max_raw - x_min_raw
+            hand_h = y_max_raw - y_min_raw
+            margin = int(max(hand_w, hand_h) * 0.15)  # 手のサイズの15%分マージン
 
-        x_min = max(0, x_min_raw - margin)
-        y_min = max(0, y_min_raw - margin)
-        x_max = min(w, x_max_raw + margin)
-        y_max = min(h, y_max_raw + margin)
+            x_min = max(0, x_min_raw - margin)
+            y_min = max(0, y_min_raw - margin)
+            x_max = min(w, x_max_raw + margin)
+            y_max = min(h, y_max_raw + margin)
 
-        # 正方形にパディング
-        cx = (x_min + x_max) // 2
-        cy = (y_min + y_max) // 2
-        side = max(x_max - x_min, y_max - y_min)
-        half = side // 2
+            # 正方形にパディング
+            cx = (x_min + x_max) // 2
+            cy = (y_min + y_max) // 2
+            side = max(x_max - x_min, y_max - y_min)
+            half = side // 2
 
-        x1 = max(0, cx - half)
-        y1 = max(0, cy - half)
-        x2 = min(w, cx + half)
-        y2 = min(h, cy + half)
+            x1 = max(0, cx - half)
+            y1 = max(0, cy - half)
+            x2 = min(w, cx + half)
+            y2 = min(h, cy + half)
 
-        # --- 背景を白で塗りつぶしたcrop画像を作成 ---
-        # 手の凸包マスクを作成（やや膨張させて手全体をカバー）
-        hull = cv2.convexHull(pts)
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.fillConvexPoly(mask, hull, 255)
+            # --- 背景を白で塗りつぶしたcrop画像を作成 ---
+            # 手の凸包マスクを作成
+            hull = cv2.convexHull(pts)
+            mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillConvexPoly(mask, hull, 255)
 
-        # マスクを膨張（手の輪郭からはみ出す部分もカバー）
-        kernel_size = max(15, int(max(hand_w, hand_h) * 0.15))
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                           (kernel_size, kernel_size))
-        mask = cv2.dilate(mask, kernel, iterations=1)
+            # マスクを膨張
+            kernel_size = max(15, int(max(hand_w, hand_h) * 0.15))
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                               (kernel_size, kernel_size))
+            mask = cv2.dilate(mask, kernel, iterations=1)
 
-        # 白背景に手だけ合成
-        masked_frame = np.full_like(frame, 255)  # 白背景
-        masked_frame[mask > 0] = frame[mask > 0]
+            # 白背景に手だけ合成
+            masked_frame = np.full_like(frame, 255)  # 白背景
+            masked_frame[mask > 0] = frame[mask > 0]
 
-        # 切り出し
-        crop = masked_frame[y1:y2, x1:x2]
-        if crop.size == 0:
-            return None, None, None
+            # 切り出し
+            crop = masked_frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
 
-        bbox = (x1, y1, x2, y2)
-        return crop, bbox, hand_lm
+            bbox = (x1, y1, x2, y2)
+            detection_results.append((crop, bbox, hand_lm))
+
+        return detection_results
 
     def draw_landmarks(self, frame, hand_lm):
         """手のランドマークを描画"""
@@ -179,165 +178,57 @@ class PoseClassifier:
         return pred_class, confidence, probs
 
 
-class TriggerLogic:
-    """静止ポーズ発動判定ロジック"""
-
-    def __init__(self, trigger_frames=TRIGGER_FRAMES,
-                 confidence_threshold=CONFIDENCE_THRESHOLD,
-                 cooldown_sec=COOLDOWN_SEC):
-        self.trigger_frames = trigger_frames
-        self.confidence_threshold = confidence_threshold
-        self.cooldown_sec = cooldown_sec
-
-        self.buffer = collections.deque(maxlen=trigger_frames)
-        self.next_allowed_time = 0.0
-        self.last_triggered = None
-        self.trigger_display_time = 0.0
-
-    def update(self, pred_class, confidence):
-        """
-        フレームの予測結果を追加し、発動条件を判定する。
-        戻り値: 発動されたクラス（発動しなければ None）
-        """
-        self.buffer.append(pred_class)
-
-        now = time.time()
-
-        if (confidence > self.confidence_threshold and
-            len(self.buffer) >= self.trigger_frames and
-            all(b == self.buffer[-1] for b in self.buffer) and
-            now > self.next_allowed_time):
-
-            triggered_class = pred_class
-            self.next_allowed_time = now + self.cooldown_sec
-            self.last_triggered = triggered_class
-            self.trigger_display_time = now
-            return triggered_class
-
-        return None
-
-    def get_display_effect(self):
-        """現在表示すべき演出テキストを返す（発動後2秒間表示）"""
-        if self.last_triggered is not None:
-            elapsed = time.time() - self.trigger_display_time
-            if elapsed < 2.0:
-                return TRIGGER_EFFECTS.get(self.last_triggered, "")
-        return None
-
-    def is_in_cooldown(self):
-        """クールダウン中かどうか"""
-        return time.time() < self.next_allowed_time
-
-
-def draw_ui(frame, bbox, pred_class, confidence, probs,
-            trigger_logic, fps, hand_detected):
-    """UIを描画"""
+def draw_ui(frame, results, fps):
+    """UIを描画 (複数手対応)"""
     h, w, _ = frame.shape
 
     # 上部の情報バー
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (w, 60), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (0, 0), (w, 40), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
 
     # FPS表示
-    cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30),
+    cv2.putText(frame, f"FPS: {fps:.1f}", (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-    # クールダウン表示
-    if trigger_logic.is_in_cooldown():
-        remaining = trigger_logic.next_allowed_time - time.time()
-        cv2.putText(frame, f"COOLDOWN: {remaining:.1f}s",
-                    (w - 250, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-
-    if not hand_detected:
+    if not results:
         cv2.putText(frame, "No hand detected", (w//2 - 100, h//2),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (128, 128, 128), 2)
         return frame
 
-    # バウンディングボックス
-    if bbox is not None:
-        x1, y1, x2, y2 = bbox
-        color = (0, 255, 0) if confidence > CONFIDENCE_THRESHOLD else (0, 165, 255)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    # 検出された各手に対して描画
+    for i, res in enumerate(results):
+        # res: (bbox, pred_class, confidence, probs)
+        # ※ main関数内で detector.detect の戻り値とは別に、予測結果を含めた構造にする想定
+        bbox, pred_class, confidence = res
+        
+        if bbox is not None:
+            x1, y1, x2, y2 = bbox
+            color = (0, 255, 0) if confidence > CONFIDENCE_THRESHOLD else (0, 165, 255)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-    # クラス名と確信度
-    label = f"{RPS_CLASSES[pred_class].upper()} ({confidence*100:.0f}%)"
-    cv2.putText(frame, label, (w//2 - 80, 45),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
-    # 確率バー
-    bar_x = 10
-    bar_y = h - 100
-    for i, (cls, prob) in enumerate(zip(RPS_CLASSES, probs)):
-        bar_w = int(prob * 200)
-        color = (0, 255, 0) if i == pred_class else (100, 100, 100)
-        cv2.rectangle(frame, (bar_x, bar_y + i*25),
-                      (bar_x + bar_w, bar_y + i*25 + 18), color, -1)
-        cv2.putText(frame, f"{cls}: {prob*100:.0f}%",
-                    (bar_x + 5, bar_y + i*25 + 14),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-
-    # バッファ進捗バー（発動までの進捗）
-    if confidence > CONFIDENCE_THRESHOLD:
-        same_count = 0
-        for b in reversed(trigger_logic.buffer):
-            if b == pred_class:
-                same_count += 1
-            else:
-                break
-        progress = min(same_count / TRIGGER_FRAMES, 1.0)
-        bar_w = int(progress * (w - 20))
-        cv2.rectangle(frame, (10, h - 15), (10 + bar_w, h - 5),
-                      (0, 255, 255), -1)
-        cv2.rectangle(frame, (10, h - 15), (w - 10, h - 5),
-                      (100, 100, 100), 1)
-
-    # 発動演出
-    effect = trigger_logic.get_display_effect()
-    if effect is not None:
-        elapsed = time.time() - trigger_logic.trigger_display_time
-        alpha = max(0, 1.0 - elapsed / 2.0)
-
-        overlay2 = frame.copy()
-        cv2.rectangle(overlay2, (0, h//2 - 60), (w, h//2 + 60),
-                      (0, 0, 128), -1)
-        cv2.addWeighted(overlay2, 0.5 * alpha, frame, 1 - 0.5 * alpha, 0, frame)
-
-        effect_texts = {
-            0: "ROCK - First Strike!",
-            1: "PAPER - Barrier Expand!",
-            2: "SCISSORS - Technique Activate!"
-        }
-        text = effect_texts.get(trigger_logic.last_triggered, "TRIGGERED!")
-        text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)[0]
-        text_x = (w - text_size[0]) // 2
-        cv2.putText(frame, text, (text_x, h//2 + 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2,
-                    (0, 255, 255), 3)
+            # バウンディングボックスの上にラベル表示
+            label = f"{RPS_CLASSES[pred_class].upper()} ({confidence*100:.0f}%)"
+            
+            # テキスト背景
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            cv2.rectangle(frame, (x1, y1 - 20), (x1 + tw, y1), color, -1)
+            
+            cv2.putText(frame, label, (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
 
     return frame
 
 
 def main():
     """メイン処理"""
-    print("🚀 ステップ3: リアルタイム推論 + 発動判定")
+    print("🚀 ステップ3: リアルタイム推論 (両手対応)")
     print("=" * 60)
 
     # モデル読み込み
-    if not os.path.exists(RPS_MODEL_PATH):
-        print(f"❌ RPS モデルが見つかりません: {RPS_MODEL_PATH}")
-        print("   先に step2_rps_train.py を実行してください。")
-        return
-
-    if not os.path.exists(HAND_MODEL_PATH):
-        print(f"❌ HandLandmarker モデルが見つかりません: {HAND_MODEL_PATH}")
-        print("   models/hand_landmarker.task をダウンロードしてください。")
-        return
-
     classifier = PoseClassifier(RPS_MODEL_PATH)
-    hand_detector = HandDetector()
-    trigger_logic = TriggerLogic()
+    # num_hands=2 に変更して両手検出に対応
+    hand_detector = HandDetector(num_hands=2)
 
     # カメラ起動
     cap = cv2.VideoCapture(0)
@@ -346,8 +237,7 @@ def main():
         return
 
     print("\n📷 カメラ起動！")
-    print("   手をカメラにかざしてグー/チョキ/パーを判定します")
-    print("   同じポーズをキープ → 演出が発動！")
+    print("   手をカメラにかざしてグー/チョキ/パーを判定します (最大2つ)")
     print("   'q' キーで終了")
     print("=" * 60)
 
@@ -369,30 +259,29 @@ def main():
             prev_time = now
             fps = 1.0 / (sum(fps_counter) / len(fps_counter)) if fps_counter else 0
 
-            # 手の検出
-            crop, bbox, landmarks = hand_detector.detect(frame)
+            # 手の検出 (0〜2つの手が返ってくる)
+            # detect_results: [(crop, bbox, landmarks), ...]
+            detect_results = hand_detector.detect(frame)
 
-            if crop is not None:
+            ui_results = []
+
+            for crop, bbox, landmarks in detect_results:
                 # ポーズ分類
                 pred_class, confidence, probs = classifier.predict(crop)
 
-                # 発動判定
-                triggered = trigger_logic.update(pred_class, confidence)
-
-                if triggered is not None:
-                    trigger_name = RPS_CLASSES[triggered]
-                    print(f"🎯 発動！ {trigger_name.upper()} "
-                          f"({TRIGGER_EFFECTS.get(triggered, '')})")
+                # UI表示用の情報を保存
+                ui_results.append((bbox, pred_class, confidence))
 
                 # ランドマーク描画
                 hand_detector.draw_landmarks(frame, landmarks)
+                
+                # ターミナルへデバッグ出力（確信度が高い場合のみ）
+                if confidence > CONFIDENCE_THRESHOLD:
+                    pass 
+                    # 必要であればここでprint出力
 
-                # UI描画
-                frame = draw_ui(frame, bbox, pred_class, confidence,
-                                probs, trigger_logic, fps, True)
-            else:
-                frame = draw_ui(frame, None, 0, 0.0, [0, 0, 0],
-                                trigger_logic, fps, False)
+            # UI描画
+            frame = draw_ui(frame, ui_results, fps)
 
             # 表示
             cv2.imshow('Finger Pose Detection', frame)
